@@ -1162,3 +1162,9 @@ saved as a chat AI, and the model a server had loaded lost to the first one it l
 app fills in isn't one the person chose: keep the two apart (nothing picked reads Automatic), leave
 the decision with the code that owns it, and test the whole path (list, form, Add), not the picker
 alone.
+
+**A key check in front of every provider locked out the one that needs none.** The asset tools
+refused to start unless some provider had a key, so a ComfyUI server on the person's own network
+could not make a picture until they pasted a key they had no use for. The check belongs per
+provider, at the point the key is read (`AssetProvider::needs_key`), not once up front for all of
+them. A test for it must run with no key of any kind and must fail when the check is put back.
