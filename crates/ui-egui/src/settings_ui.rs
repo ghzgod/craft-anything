@@ -1209,7 +1209,7 @@ fn comfy_rows(app: &mut CraftApp, ui: &mut Ui) -> bool {
             }
             rect
         });
-        model_pick::drive(app, ui, &Slot::Comfy, ask.clone(), "");
+        model_pick::drive(app, ui, &Slot::Comfy, ask.clone(), "", model_pick::Start::First);
         let picked = app.comfy_form.choice.chosen().to_string();
         if picked != app.settings.assets.comfyui.checkpoint && !(picked.is_empty() && app.comfy_form.choice.loading()) {
             app.settings.assets.comfyui.checkpoint = picked;

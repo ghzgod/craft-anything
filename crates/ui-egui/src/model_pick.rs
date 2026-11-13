@@ -42,6 +42,8 @@ pub enum Start {
     /// Nothing: an own server is asked which chat model it has loaded when it is added or tested,
     /// and a pick made here for the person would take that question's place.
     Automatic,
+    /// The first entry: ComfyUI's checkpoints make pictures, so none is a chat model to look for.
+    First,
 }
 
 /// What a listing is asked about.
@@ -149,6 +151,7 @@ impl ModelChoice {
                     // adding the server then says it has no chat model.
                     self.picked = match self.start {
                         Start::Automatic => String::new(),
+                        Start::First => models.first().cloned().unwrap_or_default(),
                         Start::Chat => Some(&self.default_model)
                             .filter(|d| models.contains(d))
                             .cloned()
@@ -550,6 +553,15 @@ mod tests {
         assert_eq!(c.chosen(), "qwen3:8b", "a pick the person made stays while it is offered");
         c.apply(models(&["deepseek-r1:8b"]));
         assert!(c.chosen().is_empty(), "and goes back to Automatic when it no longer is: {c:?}");
+    }
+
+    /// A checkpoint list starts on its first entry whatever it is called: the chat-model filter is
+    /// for AI servers, and would leave a checkpoint named like an embedding model unpicked.
+    #[test]
+    fn a_checkpoint_list_starts_on_its_first_entry() {
+        let mut c = ModelChoice { start: Start::First, ..Default::default() };
+        c.apply(models(&["embed-style.safetensors", "sd_xl_base_1.0.safetensors"]));
+        assert_eq!(c.chosen(), "embed-style.safetensors");
     }
 
     /// A failed listing leaves the typing field, and what was typed is the model.
