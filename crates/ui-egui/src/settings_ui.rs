@@ -881,7 +881,7 @@ pub(crate) fn key_controls(app: &mut CraftApp, ui: &mut Ui, d: &Detected, card: 
     let ask = model_pick::key_looks_real(&key).then(|| Ask { kind: d.suggestion.kind, base_url: d.suggestion.base_url.clone(), key: key.clone() });
     let listing = ask.is_some();
     let slot = Slot::Card(name.clone());
-    model_pick::drive(app, ui, &slot, ask, &d.suggestion.model);
+    model_pick::drive(app, ui, &slot, ask, &d.suggestion.model, model_pick::Start::Chat);
     ui.add_space(4.0);
     let mut connect = false;
     let height = if card.compact { 30.0 } else { 32.0 };
@@ -1035,7 +1035,9 @@ fn server_form_body(app: &mut CraftApp, ui: &mut Ui) {
     let mut choice = std::mem::take(&mut form.choice);
     form_row(ui, label_w, "Model", |ui, w| model_pick::model_picker(ui, "endpoint", &mut choice, w));
     form.choice = choice;
-    model_pick::drive(app, ui, &Slot::Form, ask, default_model);
+    // An own server picks its chat model itself (the one it has loaded) unless the person names one.
+    let start = if service.needs_address { model_pick::Start::Automatic } else { model_pick::Start::Chat };
+    model_pick::drive(app, ui, &Slot::Form, ask, default_model, start);
     let form = &mut app.server_form;
     // The status line keeps its height: nothing moves when text appears.
     let signature = form_signature(form);

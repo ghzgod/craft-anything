@@ -1329,6 +1329,51 @@ fn model_server() -> String {
     url
 }
 
+/// A stand-in model server that answers each path in `routes` with its body and any other request
+/// with 404, as a server that doesn't know the path would. Its address, ending in `/v1`.
+fn routed_model_server(routes: &'static [(&'static str, &'static str)]) -> String {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for mut s in listener.incoming().flatten() {
+            let _ = s.set_nonblocking(false);
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            // The whole header, however TCP split it.
+            let (mut head, mut buf) = (Vec::new(), [0u8; 1024]);
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 16 * 1024 {
+                match s.read(&mut buf) {
+                    Ok(n) if n > 0 => head.extend_from_slice(buf.get(..n).unwrap_or_default()),
+                    _ => break,
+                }
+            }
+            let head = String::from_utf8_lossy(&head);
+            let path = head.split_whitespace().nth(1).unwrap_or_default();
+            let (status, body) = routes.iter().find(|(route, _)| *route == path).map_or(("404 Not Found", "{}"), |(_, body)| ("200 OK", *body));
+            let _ = write!(s, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    url
+}
+
+/// Settings → AI on the Custom endpoint tab, with an own server typed into the form and its
+/// models listed.
+fn custom_form_listing(name: &str, url: &str) -> Harness<'static, CraftApp> {
+    let mut h = harness(|| {
+        let mut a = demo::app(demo::engine(Mode::Experienced, true));
+        a.state.settings_open = true;
+        a.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+        a
+    });
+    h.run_steps(2);
+    h.state_mut().state.detect_tab = Some(craft_anything_ui_egui::detect_tabs::DetectTab::Custom);
+    h.state_mut().server_form = craft_anything_ui_egui::ServerForm { name: name.into(), address: url.into(), ..Default::default() };
+    assert!(wait(&mut h, |a| !a.server_form.choice.models.is_empty()), "the server's models are listed");
+    h.get_by_label("Add").scroll_to_me();
+    h.run_steps(3);
+    h
+}
+
 /// #123, #127: the model an AI uses is changed in Settings → AI from the ones it lists.
 #[test]
 fn an_ais_model_is_changed_in_settings() {
@@ -1401,6 +1446,64 @@ fn an_ai_server_is_added_by_its_address() {
     h.get_by_label("Add").click();
     assert!(wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Studio box" && b.model == "qwen3:8b")), "added with a model that can chat");
     assert!(h.state().server_form.name.is_empty(), "the form empties once it's added");
+}
+
+/// An own server that lists only an embedding model is never added with it. The list stays on
+/// Automatic (nothing is picked for the person), so Add asks the server as it did before there was
+/// a list, and says it has no model that can chat.
+#[test]
+fn a_server_with_no_chat_model_is_not_added_from_its_list() {
+    let url = routed_model_server(&[("/v1/models", r#"{"object":"list","data":[{"id":"nomic-embed-text"}]}"#)]);
+    let mut h = custom_form_listing("Embed box", &url);
+    let form = &h.state().server_form;
+    assert_eq!(form.choice.models, ["nomic-embed-text"]);
+    assert!(form.choice.chosen().is_empty(), "nothing is picked from a list with no chat model: {:?}", form.choice);
+    h.get_by_label("Add").click();
+    assert!(
+        wait(&mut h, |a| a.state.toasts.iter().any(|(text, error)| *error && text.contains("doesn't list a model that can chat"))),
+        "{:?}",
+        h.state().state.toasts
+    );
+    assert!(h.state().server_form.connecting.is_none());
+    h.state_mut().refresh_backends();
+    h.run_steps(3);
+    assert!(h.state().backends.iter().all(|b| b.name != "Embed box"), "it wasn't added");
+    assert!(h.state().hub.config().backends.iter().all(|b| b.config.name != "Embed box"), "nothing was saved");
+    assert_eq!(h.state().server_form.name, "Embed box", "what was typed is kept to fix it");
+}
+
+/// An own server's list doesn't decide its model: with nothing picked, Add uses the chat model the
+/// server has loaded, not the first one it lists (asking for that one could unload the other).
+/// A model the person picks from the list is used as it is.
+#[test]
+fn an_own_server_is_added_with_its_loaded_model_unless_one_is_picked() {
+    let url = routed_model_server(&[
+        ("/v1/models", r#"{"object":"list","data":[{"id":"deepseek-r1:8b"},{"id":"qwen3:8b"}]}"#),
+        ("/api/ps", r#"{"models":[{"name":"qwen3:8b","model":"qwen3:8b"}]}"#),
+    ]);
+    let mut h = custom_form_listing("Loaded box", &url);
+    assert!(h.state().server_form.choice.chosen().is_empty(), "the list starts on Automatic: {:?}", h.state().server_form.choice);
+    h.get_by_label("Add").click();
+    assert!(wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Loaded box")), "{:?}", h.state().state.toasts);
+    assert_eq!(
+        h.state().backends.iter().find(|b| b.name == "Loaded box").map(|b| b.model.as_str()),
+        Some("qwen3:8b"),
+        "the loaded model, not the list's first"
+    );
+    // Picked by the person: that model, loaded or not.
+    h.state_mut().server_form = craft_anything_ui_egui::ServerForm { name: "Picked box".into(), address: url.clone(), ..Default::default() };
+    assert!(wait(&mut h, |a| !a.server_form.choice.models.is_empty()));
+    h.get_by_label("Model").scroll_to_me();
+    h.run_steps(3);
+    h.get_by_label("Model").click();
+    h.run_steps(2);
+    h.get_by_label("deepseek-r1:8b").click();
+    h.run_steps(2);
+    assert_eq!(h.state().server_form.choice.chosen(), "deepseek-r1:8b");
+    h.get_by_label("Add").scroll_to_me();
+    h.run_steps(3);
+    h.get_by_label("Add").click();
+    assert!(wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Picked box" && b.model == "deepseek-r1:8b")), "{:?}", h.state().state.toasts);
 }
 
 /// #53: an agent app installed where it isn't looked for gets its program chosen in Settings → AI,

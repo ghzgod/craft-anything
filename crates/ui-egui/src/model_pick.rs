@@ -1,6 +1,7 @@
 //! Choosing a model from what a service or server lists. The endpoint form and the key cards share
 //! it: the person types an address or pastes a key, and once they stop typing the models come
-//! (never saved, never on the UI thread), with the likeliest one already chosen.
+//! (never saved, never on the UI thread), with the likeliest one already chosen. An own server's
+//! list starts on Automatic instead: it says which model it has loaded when it is added.
 
 use crate::i18n::{tr, trf};
 use crate::theme::Tokens;
@@ -27,6 +28,17 @@ pub enum Slot {
     Form,
     /// A card that asks for a key, by the AI's name.
     Card(String),
+}
+
+/// What a list starts on, before the person picks from it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Start {
+    /// The service's own model when listed, else the first that can chat; nothing when none can.
+    #[default]
+    Chat,
+    /// Nothing: an own server is asked which chat model it has loaded when it is added or tested,
+    /// and a pick made here for the person would take that question's place.
+    Automatic,
 }
 
 /// What a listing is asked about.
@@ -57,8 +69,11 @@ pub struct ModelChoice {
     pub awaiting: Option<u64>,
     pub models: Vec<String>,
     pub error: Option<String>,
-    /// The model picked from the list.
+    /// The model picked from the list. Empty: none, so the service's default or the server's own
+    /// choice is used.
     pub picked: String,
+    /// What the list starts on.
+    pub start: Start,
     /// "Custom model or alias…" is chosen.
     pub custom: bool,
     /// What was typed for it (also used when there is no list).
@@ -127,12 +142,16 @@ impl ModelChoice {
             Ok(models) if !models.is_empty() => {
                 self.error = None;
                 if !models.contains(&self.picked) {
-                    self.picked = Some(&self.default_model)
-                        .filter(|d| models.contains(d))
-                        .cloned()
-                        .or_else(|| craft_anything_ai::first_chat_model(&models))
-                        .or_else(|| models.first().cloned())
-                        .unwrap_or_default();
+                    // Never a model that can't chat: a list of those leaves the choice empty, and
+                    // adding the server then says it has no chat model.
+                    self.picked = match self.start {
+                        Start::Automatic => String::new(),
+                        Start::Chat => Some(&self.default_model)
+                            .filter(|d| models.contains(d))
+                            .cloned()
+                            .or_else(|| craft_anything_ai::first_chat_model(&models))
+                            .unwrap_or_default(),
+                    };
                 }
                 self.models = models;
             }
@@ -169,10 +188,11 @@ pub fn key_looks_real(key: &str) -> bool {
 }
 
 /// Run one choice's debounce this frame and start the listing when it is due.
-pub(crate) fn drive(app: &mut CraftApp, ui: &Ui, slot: &Slot, ask: Option<Ask>, default_model: &str) {
+pub(crate) fn drive(app: &mut CraftApp, ui: &Ui, slot: &Slot, ask: Option<Ask>, default_model: &str, start: Start) {
     let now = ui.input(|i| i.time);
     let choice = choice_mut(app, slot);
     choice.default_model = default_model.to_string();
+    choice.start = start;
     match choice.step(now, ask) {
         Poll::Idle => {}
         Poll::Wait(s) => ui.ctx().request_repaint_after(Duration::from_secs_f64(s.max(0.02))),
@@ -182,6 +202,7 @@ pub(crate) fn drive(app: &mut CraftApp, ui: &Ui, slot: &Slot, ask: Option<Ask>, 
 
 /// The model control, `width` wide in all: a list of what was found, with a last entry to type any
 /// id (the list and the typing field then share the width); with no list, the typing field alone.
+/// With nothing picked it reads Automatic, which an own server's list also offers as its first entry.
 /// Read [`ModelChoice::chosen`]. Returns the first control's rect, for lining a label up with it.
 pub(crate) fn model_picker(ui: &mut Ui, id_salt: impl std::hash::Hash + std::fmt::Debug, choice: &mut ModelChoice, width: f32) -> egui::Rect {
     let t = Tokens::get(ui.ctx());
@@ -194,13 +215,23 @@ pub(crate) fn model_picker(ui: &mut Ui, id_salt: impl std::hash::Hash + std::fmt
     }
     let gap = ui.spacing().item_spacing.x;
     let combo_w = if choice.custom { ((width - gap) / 2.0).max(60.0) } else { width };
-    let shown = if choice.custom { tr(CUSTOM) } else { choice.picked.clone() };
+    let automatic = !choice.custom && choice.picked.is_empty();
+    let shown = if choice.custom {
+        tr(CUSTOM)
+    } else if automatic {
+        tr("Automatic")
+    } else {
+        choice.picked.clone()
+    };
     let (mut pick, mut custom) = (None, false);
     let r = egui::ComboBox::from_id_salt((&id_salt, "model"))
         .icon(widgets::combo_icon)
         .width(combo_w)
         .selected_text(egui::RichText::new(shown).size(crate::theme::CAPTION + 1.0))
         .show_ui(ui, |ui| {
+            if choice.start == Start::Automatic && ui.selectable_label(automatic, tr("Automatic")).clicked() {
+                pick = Some(String::new());
+            }
             for m in &choice.models {
                 if ui.selectable_label(!choice.custom && *m == choice.picked, m).clicked() {
                     pick = Some(m.clone());
@@ -425,6 +456,24 @@ mod tests {
         c.picked = "qwen3:8b".into();
         c.apply(models(&["nomic-embed-text", "qwen3:8b", "x"]));
         assert_eq!(c.picked, "qwen3:8b", "a pick that is still offered stays");
+    }
+
+    /// A list with nothing that can chat leaves the choice empty, and an own server's list starts on
+    /// nothing at all: the model is then the service's default or the one the server has loaded,
+    /// never one picked for the person.
+    #[test]
+    fn a_model_is_never_picked_for_the_person_where_the_server_decides() {
+        let mut c = ModelChoice::default();
+        c.apply(models(&["nomic-embed-text", "bge-m3"]));
+        assert!(c.picked.is_empty() && c.chosen().is_empty(), "{c:?}");
+        let mut c = ModelChoice { start: Start::Automatic, ..Default::default() };
+        c.apply(models(&["deepseek-r1:8b", "qwen3:8b"]));
+        assert!(c.chosen().is_empty(), "an own server's list starts on Automatic: {c:?}");
+        c.picked = "qwen3:8b".into();
+        c.apply(models(&["deepseek-r1:8b", "qwen3:8b"]));
+        assert_eq!(c.chosen(), "qwen3:8b", "a pick the person made stays while it is offered");
+        c.apply(models(&["deepseek-r1:8b"]));
+        assert!(c.chosen().is_empty(), "and goes back to Automatic when it no longer is: {c:?}");
     }
 
     /// A failed listing leaves the typing field, and what was typed is the model.
