@@ -9,6 +9,7 @@ use super::{AssetProvider, AssetRequest, Generated, Shape, fal};
 use craft_anything_evidence::{ErrorCode, ToolError};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -19,6 +20,9 @@ pub const ID: &str = "comfyui";
 const NEGATIVE: &str = "blurry, low quality, watermark, text";
 /// The largest workflow file read.
 const MAX_WORKFLOW: u64 = 2 << 20;
+/// The most text the placeholders of one workflow may put into it, counted over all of its
+/// strings: the file's size says nothing about how often it repeats `{{prompt}}`.
+const MAX_FILLED: usize = 2 << 20;
 /// The largest JSON answer kept.
 const MAX_JSON: u64 = 8 << 20;
 /// The largest picture kept.
@@ -259,7 +263,8 @@ fn builtin_graph(v: &Vars) -> Value {
     })
 }
 
-/// The person's API-format workflow, with the placeholders in its string values filled in.
+/// The person's API-format workflow, with the placeholders in its string values filled in. Refused
+/// when they would add more than [`MAX_FILLED`], before that text is made.
 fn from_workflow(path: &std::path::Path, vars: &Vars) -> Result<Value, ToolError> {
     let bad = |why: String| {
         ToolError::new(ErrorCode::BadSettings, format!("The ComfyUI workflow file can't be used: {why}"))
@@ -277,13 +282,24 @@ fn from_workflow(path: &std::path::Path, vars: &Vars) -> Result<Value, ToolError
     if !api_graph {
         return Err(bad("it isn't an API-format graph (an object of nodes)".into()));
     }
-    fill(&mut graph, vars);
+    let mut budget = MAX_FILLED;
+    fill(&mut graph, vars, &mut budget).map_err(|Overfilled| {
+        ToolError::new(ErrorCode::BadSettings, "The ComfyUI workflow file can't be used: its placeholders would put more than 2 MB of text into it.")
+            .with_remediation(
+                "Keep {{prompt}} and the other placeholders to the nodes that need them, then pick the file again in Settings → Builds → Picture model.",
+            )
+    })?;
     Ok(graph)
 }
 
+/// The placeholders of a workflow would add more text than the budget allows.
+#[derive(Debug, PartialEq)]
+struct Overfilled;
+
 /// Fill the placeholders in every string value. A string that is just `{{width}}`, `{{height}}` or
-/// `{{seed}}` becomes a number.
-fn fill(v: &mut Value, vars: &Vars) {
+/// `{{seed}}` becomes a number. `budget` is the text the placeholders may still add, shared by the
+/// whole graph and taken from before each value is copied in.
+fn fill(v: &mut Value, vars: &Vars, budget: &mut usize) -> Result<(), Overfilled> {
     match v {
         Value::String(s) => {
             let whole = match s.as_str() {
@@ -294,17 +310,19 @@ fn fill(v: &mut Value, vars: &Vars) {
             };
             match whole {
                 Some(n) => *v = n,
-                None => *s = substitute(s, vars),
+                None => *s = substitute(s, vars, budget)?,
             }
+            Ok(())
         }
-        Value::Array(items) => items.iter_mut().for_each(|i| fill(i, vars)),
-        Value::Object(map) => map.values_mut().for_each(|i| fill(i, vars)),
-        _ => {}
+        Value::Array(items) => items.iter_mut().try_for_each(|i| fill(i, vars, budget)),
+        Value::Object(map) => map.values_mut().try_for_each(|i| fill(i, vars, budget)),
+        _ => Ok(()),
     }
 }
 
 /// One left-to-right pass, so text put in by a placeholder is never read as another placeholder.
-fn substitute(template: &str, vars: &Vars) -> String {
+/// Each value is taken from `budget` before it is copied.
+fn substitute(template: &str, vars: &Vars, budget: &mut usize) -> Result<String, Overfilled> {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(start) = rest.find("{{") {
@@ -312,26 +330,29 @@ fn substitute(template: &str, vars: &Vars) -> String {
         let after = rest.get(start..).unwrap_or_default();
         let Some(end) = after.find("}}") else {
             out.push_str(after);
-            return out;
+            return Ok(out);
         };
         let name = after.get(2..end).unwrap_or_default();
-        let value = match name {
-            "prompt" => Some(vars.prompt.to_string()),
-            "negative" => Some(vars.negative.to_string()),
-            "width" => Some(vars.width.to_string()),
-            "height" => Some(vars.height.to_string()),
-            "seed" => Some(vars.seed.to_string()),
-            "checkpoint" => Some(vars.checkpoint.to_string()),
+        let value: Option<Cow<str>> = match name {
+            "prompt" => Some(vars.prompt.into()),
+            "negative" => Some(vars.negative.into()),
+            "width" => Some(vars.width.to_string().into()),
+            "height" => Some(vars.height.to_string().into()),
+            "seed" => Some(vars.seed.to_string().into()),
+            "checkpoint" => Some(vars.checkpoint.into()),
             _ => None,
         };
         match value {
-            Some(v) => out.push_str(&v),
+            Some(v) => {
+                *budget = budget.checked_sub(v.len()).ok_or(Overfilled)?;
+                out.push_str(&v);
+            }
             None => out.push_str(after.get(..end + 2).unwrap_or_default()),
         }
         rest = after.get(end + 2..).unwrap_or_default();
     }
     out.push_str(rest);
-    out
+    Ok(out)
 }
 
 struct Image {
@@ -614,6 +635,41 @@ mod tests {
         let big = dir.path().join("big.json");
         std::fs::write(&big, vec![b' '; (MAX_WORKFLOW + 10) as usize]).unwrap();
         assert!(picture(&ComfyUi::new(base, "m", Some(big)), "x", Shape::Square).unwrap_err().message.contains("2 MB"));
+    }
+
+    /// The file's 2 MB limit doesn't bound what its placeholders fill in to: every `{{prompt}}` takes
+    /// the whole prompt. The text they add is counted over the whole graph, and one placeholder too
+    /// many refuses the workflow before its text is copied.
+    #[test]
+    fn placeholders_share_one_budget_across_the_graph() {
+        let vars = Vars { prompt: "0123456789", negative: "", width: 512, height: 512, seed: 7, checkpoint: "m" };
+        let graph = |repeats: usize| json!({"1": {"inputs": {"text": "{{prompt}}".repeat(repeats)}}, "2": {"inputs": {"list": ["{{prompt}} and {{prompt}}"]}}});
+        // Five prompts of ten bytes: exactly the budget, then one byte short of it.
+        let mut fits = graph(3);
+        let mut budget = 50;
+        assert_eq!(fill(&mut fits, &vars, &mut budget), Ok(()));
+        assert_eq!((budget, fits["1"]["inputs"]["text"].as_str().map(str::len)), (0, Some(30)));
+        assert_eq!(fill(&mut graph(3), &vars, &mut 49), Err(Overfilled), "the last placeholder, in another node, is one too many");
+        // A number written whole takes nothing, and neither does a placeholder nobody knows.
+        let mut free = json!({"1": {"inputs": {"width": "{{width}}", "other": "{{unknown}}"}}});
+        assert_eq!(fill(&mut free, &vars, &mut 0), Ok(()));
+        assert_eq!(free["1"]["inputs"]["width"], json!(512));
+    }
+
+    /// A small file that repeats `{{prompt}}` is refused with what to change, and nothing is sent.
+    #[test]
+    fn a_workflow_that_repeats_a_placeholder_past_the_budget_is_never_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("flow.json");
+        let prompt = "p".repeat(2000);
+        let repeats = MAX_FILLED / prompt.len() + 1;
+        std::fs::write(&file, json!({"1": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{prompt}}".repeat(repeats)}}}).to_string()).unwrap();
+        assert!(std::fs::metadata(&file).unwrap().len() < MAX_WORKFLOW / 100, "a file far under its own limit");
+        let (base, seen) = happy(b"png");
+        let err = picture(&ComfyUi::new(base, "m.ckpt", Some(file)), &prompt, Shape::Square).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadSettings);
+        assert!(err.message.contains("placeholders") && err.remediation.unwrap_or_default().contains("{{prompt}}"), "{}", err.message);
+        assert!(seen.lock().unwrap().is_empty(), "nothing reached the server");
     }
 
     /// Only a graph of nodes is sent: a settings or credentials file picked by mistake, or an empty
