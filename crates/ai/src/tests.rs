@@ -995,14 +995,16 @@ fn models_are_listed_and_tried_without_saving_anything() {
 }
 
 /// #1434 for the form's Test: an own server with no model named is tried with the chat model it
-/// has loaded, as adding it would pick, never the first entry of a download catalogue.
+/// has loaded, as adding it would pick, never the first entry of a download catalogue. The
+/// stand-in answers only questions that end in `/models`, so it says what is loaded the way LM
+/// Studio does, after `/api/ps` finds nothing.
 #[test]
 fn an_unsaved_server_is_tried_with_the_model_it_has_loaded() {
     let (h, _d) = hub();
     let reply = chat_sse(&[json!({"model":"qwen3:8b","choices":[{"delta":{"content":"ready"},"finish_reason":"stop"}]})]);
     let (url, seen) = mock(vec![
         (200, "application/json", r#"{"data":[{"id":"deepseek-r1:8b"},{"id":"qwen3:8b"}]}"#.into()),
-        (200, "application/json", r#"{"models":[{"name":"qwen3:8b","model":"qwen3:8b"}]}"#.into()),
+        (200, "application/json", r#"{"data":[{"id":"deepseek-r1:8b","state":"not-loaded"},{"id":"qwen3:8b","state":"loaded"}]}"#.into()),
         (200, "text/event-stream", reply),
     ]);
     let config = BackendConfig {
@@ -1016,7 +1018,7 @@ fn an_unsaved_server_is_tried_with_the_model_it_has_loaded() {
     let report = h.test_config(&config, None).unwrap();
     assert_eq!(report.model, "qwen3:8b");
     let seen = seen.lock().unwrap();
-    assert_eq!(seen.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), ["/v1/models", "/api/ps", "/v1/chat/completions"]);
+    assert_eq!(seen.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), ["/v1/models", "/api/v0/models", "/v1/chat/completions"]);
     assert_eq!(seen[2].body["model"], "qwen3:8b", "the loaded model, not the catalogue's first");
 }
 
